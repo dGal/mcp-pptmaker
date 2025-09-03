@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+pnpm-lock.yaml
+yarn.lock
+package-lock.json
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+logs/
+*.log
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Env / Secrets
+.env
+.env.*
+!.env.example
+
+# Caches / Temp
+.cache/
+.tmp/
+tmp/
+coverage/
+dist/
+build/
+out/
+
+# Marp artifacts (if any leftover)
+*.pptx
+*.pdf
+*.html
