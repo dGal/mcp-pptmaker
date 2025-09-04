@@ -7,6 +7,9 @@ import path from "path";
 import os from "os";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
+import { createReadStream } from "fs";
+import { createServer } from "http";
+import { randomUUID as uuidv4 } from "node:crypto";
 
 const MIME_PPTX = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
 
@@ -57,8 +60,7 @@ async function generateWithApi(markdown) {
     await fs.access(outputPath);
     const data = await fs.readFile(outputPath);
     const base64 = data.toString("base64");
-    await safeRm(tmpDir);
-    return { filename: outputName, base64 };
+    return { filename: outputName, base64, outputPath, tmpDir };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     await safeRm(tmpDir);
@@ -125,10 +127,7 @@ async function generateWithCli(markdown) {
 
   const data = await fs.readFile(outputPath);
   const base64 = data.toString("base64");
-
-  await safeRm(tmpDir);
-
-  return { filename: "presentation.pptx", base64 };
+  return { filename: "presentation.pptx", base64, outputPath, tmpDir };
 }
 
 async function safeRm(target) {
@@ -137,6 +136,126 @@ async function safeRm(target) {
   } catch {
     // ignore
   }
+}
+
+// Lightweight HTTP file server for temporary downloads
+const FILE_HOST = process.env.MCP_PPT_HOST || "127.0.0.1";
+const FILE_PORT = process.env.MCP_PPT_PORT ? parseInt(process.env.MCP_PPT_PORT, 10) : 0; // 0 = ephemeral port
+const FILE_TTL_MS =
+  (process.env.MCP_PPT_TTL_SEC ? parseInt(process.env.MCP_PPT_TTL_SEC, 10) : 1800) * 1000; // default 30min
+const FILE_BASE_DIR = path.join(os.tmpdir(), "mcp-pptmaker-files");
+
+let fileServerPromise = null;
+let fileServerPort = null;
+// id -> { path, filename, mimeType, expiresAt }
+const filesIndex = new Map();
+
+function getBaseUrl() {
+  const host = FILE_HOST.includes(":") ? `[${FILE_HOST}]` : FILE_HOST;
+  return `http://${host}:${fileServerPort}`;
+}
+
+async function cleanExpiredFiles() {
+  const now = Date.now();
+  for (const [id, meta] of Array.from(filesIndex.entries())) {
+    if (now > meta.expiresAt) {
+      filesIndex.delete(id);
+      try {
+        await fs.rm(path.dirname(meta.path), { recursive: true, force: true });
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+async function ensureFileServer() {
+  if (fileServerPromise) return fileServerPromise;
+  await fs.mkdir(FILE_BASE_DIR, { recursive: true });
+
+  fileServerPromise = new Promise((resolve, reject) => {
+    const srv = createServer(async (req, res) => {
+      try {
+        const url = new URL(req.url, "http://localhost");
+        if (req.method !== "GET") {
+          res.statusCode = 405;
+          res.end("Method Not Allowed");
+          return;
+        }
+
+        const parts = url.pathname.split("/").filter(Boolean); // e.g., ["files", "{id}", "{name}"]
+        if (parts.length >= 2 && parts[0] === "files") {
+          const id = parts[1];
+          const meta = filesIndex.get(id);
+          if (!meta) {
+            res.statusCode = 404;
+            res.end("Not found");
+            return;
+          }
+          if (Date.now() > meta.expiresAt) {
+            filesIndex.delete(id);
+            try {
+              await fs.rm(path.dirname(meta.path), { recursive: true, force: true });
+            } catch {}
+            res.statusCode = 410;
+            res.end("Gone");
+            return;
+          }
+
+          res.setHeader("Content-Type", meta.mimeType);
+          res.setHeader(
+            "Content-Disposition",
+            `attachment; filename="${encodeURIComponent(meta.filename)}"`
+          );
+          res.setHeader("X-Expires-At", new Date(meta.expiresAt).toISOString());
+          res.setHeader("Cache-Control", "public, max-age=600");
+          res.setHeader("X-Content-Type-Options", "nosniff");
+          res.setHeader("Access-Control-Allow-Origin", "*");
+
+          const stream = createReadStream(meta.path);
+          stream.on("error", () => {
+            res.statusCode = 404;
+            res.end("Not found");
+          });
+          stream.pipe(res);
+          return;
+        }
+
+        res.statusCode = 404;
+        res.end("Not found");
+      } catch {
+        res.statusCode = 500;
+        res.end("Internal error");
+      }
+    });
+
+    srv.listen(FILE_PORT, FILE_HOST, () => {
+      const addr = srv.address();
+      fileServerPort = typeof addr === "object" && addr ? addr.port : FILE_PORT;
+      // Periodic TTL cleanup
+      setInterval(cleanExpiredFiles, 60 * 1000).unref();
+      resolve(srv);
+    });
+
+    srv.on("error", reject);
+  });
+
+  return fileServerPromise;
+}
+
+async function publishAndLinkFile(tempPath, filename, mimeType) {
+  await ensureFileServer();
+  const id = typeof uuidv4 === "function" ? uuidv4() : Math.random().toString(36).slice(2);
+  const dir = path.join(FILE_BASE_DIR, id);
+  await fs.mkdir(dir, { recursive: true });
+  const dstPath = path.join(dir, filename);
+  await fs.copyFile(tempPath, dstPath);
+
+  const expiresAt = Date.now() + FILE_TTL_MS;
+  filesIndex.set(id, { path: dstPath, filename, mimeType, expiresAt });
+
+  const link = `${getBaseUrl()}/files/${id}/${encodeURIComponent(filename)}`;
+  return { link, expiresAt, id };
 }
 
 // Create MCP Server
@@ -164,17 +283,30 @@ server.tool(
         result = await generateWithCli(markdown);
       }
 
-      const payload = {
-        filename: result.filename,
-        mimeType: MIME_PPTX,
-        base64: result.base64,
-      };
+      const { link, expiresAt } = await publishAndLinkFile(
+        result.outputPath,
+        result.filename,
+        MIME_PPTX
+      );
+
+      // Clean up marp temp dir
+      try { await safeRm(result.tmpDir); } catch {}
+
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(payload, null, 2),
+            text:
+              `Download PPTX: ${link}\n` +
+              `Expires: ${new Date(expiresAt).toISOString()}\n` +
+              `Filename: ${result.filename}\n` +
+              `MimeType: ${MIME_PPTX}`
           },
+          {
+            type: "resource",
+            uri: link,
+            mimeType: MIME_PPTX
+          }
         ],
       };
     } catch (err) {
