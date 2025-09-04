@@ -301,11 +301,6 @@ server.tool(
               `Expires: ${new Date(expiresAt).toISOString()}\n` +
               `Filename: ${result.filename}\n` +
               `MimeType: ${MIME_PPTX}`
-          },
-          {
-            type: "resource",
-            uri: link,
-            mimeType: MIME_PPTX
           }
         ],
       };
